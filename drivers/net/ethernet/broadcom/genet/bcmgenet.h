@@ -467,8 +467,15 @@ struct bcmgenet_rx_stats64 {
 #define DMA_ARBITER_WRR			0x01
 #define DMA_ARBITER_SP			0x02
 
-struct enet_cb {
+struct enet_tx_cb {
 	struct sk_buff      *skb;
+	void __iomem *bd_addr;
+	DEFINE_DMA_UNMAP_ADDR(dma_addr);
+	DEFINE_DMA_UNMAP_LEN(dma_len);
+};
+
+struct enet_rx_cb {
+	struct page      *page;
 	void __iomem *bd_addr;
 	DEFINE_DMA_UNMAP_ADDR(dma_addr);
 	DEFINE_DMA_UNMAP_LEN(dma_len);
@@ -529,19 +536,19 @@ struct bcmgenet_hw_params {
 };
 
 struct bcmgenet_skb_cb {
-	struct enet_cb *first_cb;	/* First control block of SKB */
-	struct enet_cb *last_cb;	/* Last control block of SKB */
+	struct enet_tx_cb *first_cb;	/* First control block of SKB */
+	struct enet_tx_cb *last_cb;	/* Last control block of SKB */
 	unsigned int bytes_sent;	/* bytes on the wire (no TSB) */
 };
 
-#define GENET_CB(skb)	((struct bcmgenet_skb_cb *)((skb)->cb))
+#define GENET_TX_CB(skb)	((struct bcmgenet_skb_cb *)((skb)->cb))
 
 struct bcmgenet_tx_ring {
 	spinlock_t	lock;		/* ring lock */
 	struct napi_struct napi;	/* NAPI per tx queue */
 	struct bcmgenet_tx_stats64 stats64;
 	unsigned int	index;		/* ring index */
-	struct enet_cb	*cbs;		/* tx ring buffer control block*/
+	struct enet_tx_cb	*cbs;		/* tx ring buffer control block*/
 	unsigned int	size;		/* size of each tx ring */
 	unsigned int    clean_ptr;      /* Tx ring clean pointer */
 	unsigned int	c_index;	/* last consumer index of each ring*/
@@ -564,8 +571,10 @@ struct bcmgenet_net_dim {
 struct bcmgenet_rx_ring {
 	struct napi_struct napi;	/* Rx NAPI struct */
 	struct bcmgenet_rx_stats64 stats64;
+	struct page_pool *page_pool;
+	struct xdp_rxq_info xdp_rxq;
 	unsigned int	index;		/* Rx ring index */
-	struct enet_cb	*cbs;		/* Rx ring buffer control block */
+	struct enet_rx_cb	*cbs;		/* Rx ring buffer control block */
 	unsigned int	size;		/* Rx ring size */
 	unsigned int	c_index;	/* Rx last consumer index */
 	unsigned int	read_ptr;	/* Rx ring read pointer */
@@ -600,14 +609,14 @@ struct bcmgenet_priv {
 
 	/* transmit variables */
 	void __iomem *tx_bds;
-	struct enet_cb *tx_cbs;
+	struct enet_tx_cb *tx_cbs;
 	unsigned int num_tx_bds;
 
 	struct bcmgenet_tx_ring tx_rings[GENET_MAX_MQ_CNT + 1];
 
 	/* receive variables */
 	void __iomem *rx_bds;
-	struct enet_cb *rx_cbs;
+	struct enet_rx_cb *rx_cbs;
 	unsigned int num_rx_bds;
 	unsigned int rx_buf_len;
 	struct bcmgenet_rxnfc_rule rxnfc_rules[MAX_NUM_OF_FS_RULES];
@@ -663,6 +672,9 @@ struct bcmgenet_priv {
 	struct clk *clk_wol;
 	u32 wolopts;
 	u8 sopass[SOPASS_MAX];
+
+	/* XDP */
+	struct bpf_prog *xdp_prog;
 
 	struct bcmgenet_mib_counters mib;
 
