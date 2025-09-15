@@ -53,6 +53,11 @@
 #define RX_BUF_LENGTH		2048
 #define SKB_ALIGNMENT		32
 
+#define GENET_SKB_HEADROOM  ALIGN(max(NET_SKB_PAD, XDP_PACKET_HEADROOM), SKB_ALIGNMENT)
+#define GENET_SKB_PAD (SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) + \
+                          GENET_SKB_HEADROOM)
+#define GENET_MAX_RX_BUF_SIZE (GENET_RX_BUF_LEN - GENET_SKB_PAD)
+
 /* Tx/Rx DMA register offset, skip 256 descriptors */
 #define WORDS_PER_BD(p)		(p->hw_params->words_per_bd)
 #define DMA_DESC_SIZE		(WORDS_PER_BD(priv) * sizeof(u32))
@@ -1897,24 +1902,6 @@ static struct sk_buff *bcmgenet_free_tx_cb(struct device *dev,
 	return NULL;
 }
 
-/* Simple helper to free a receive control block's resources */
-static struct sk_buff *bcmgenet_free_rx_cb(struct device *dev,
-					   struct enet_rx_cb *cb)
-{
-	struct sk_buff *skb;
-
-	skb = cb->skb;
-	cb->skb = NULL;
-
-	if (dma_unmap_addr(cb, dma_addr)) {
-		dma_unmap_single(dev, dma_unmap_addr(cb, dma_addr),
-				 dma_unmap_len(cb, dma_len), DMA_FROM_DEVICE);
-		dma_unmap_addr_set(cb, dma_addr, 0);
-	}
-
-	return skb;
-}
-
 /* Unlocked version of the reclaim routine */
 static unsigned int __bcmgenet_tx_reclaim(struct net_device *dev,
 					  struct bcmgenet_tx_ring *ring)
@@ -2251,46 +2238,64 @@ out_unmap_frags:
 	goto out;
 }
 
-static struct sk_buff *bcmgenet_rx_refill(struct bcmgenet_priv *priv,
-					  struct enet_rx_cb *cb)
+static int bcmgenet_rx_refill(struct bcmgenet_priv *priv,
+                              struct enet_cb *cb,
+                              gfp_t gfp_mask)
 {
-	struct device *kdev = &priv->pdev->dev;
+    struct page *page;
+    dma_addr_t dma;
+
+    /* Allocate a page from the pool */
+    page = page_pool_alloc_pages(priv->rx_pp, gfp_mask | __GFP_NOWARN);
+    if (!page) {
+        priv->mib.alloc_rx_buff_failed++;
+        return -ENOMEM;
+    }
+
+    /* Get DMA address for NIC */
+    dma = page_pool_get_dma_addr(page);
+
+    /* Program descriptor with this DMA address */
+    dmadesc_set_addr(priv, cb->bd_addr, dma);
+
+    /* Save state in control block */
+    cb->page = page;
+    dma_unmap_addr_set(cb, dma_addr, dma);
+    dma_unmap_len_set(cb, dma_len, priv->rx_buf_len);
+
+    return 0;
+}
+
+static struct sk_buff *
+genet_desc_rx_build_skb(struct page_pool *pool,
+		      struct xdp_buff *xdp)
+{
+	struct skb_shared_info *sinfo = xdp_get_shared_info_from_buff(xdp);
+	u32 metasize = xdp->data - xdp->data_meta;
 	struct sk_buff *skb;
-	struct sk_buff *rx_skb;
-	dma_addr_t mapping;
+	u8 num_frags;
 
-	/* Allocate a new Rx skb */
-	skb = __netdev_alloc_skb(priv->dev, priv->rx_buf_len + SKB_ALIGNMENT,
-				 GFP_ATOMIC | __GFP_NOWARN);
-	if (!skb) {
-		priv->mib.alloc_rx_buff_failed++;
-		netif_err(priv, rx_err, priv->dev,
-			  "%s: Rx skb allocation failed\n", __func__);
-		return NULL;
-	}
+	if (unlikely(xdp_buff_has_frags(xdp)))
+		num_frags = sinfo->nr_frags;
 
-	/* DMA-map the new Rx skb */
-	mapping = dma_map_single(kdev, skb->data, priv->rx_buf_len,
-				 DMA_FROM_DEVICE);
-	if (dma_mapping_error(kdev, mapping)) {
-		priv->mib.rx_dma_failed++;
-		dev_kfree_skb_any(skb);
-		netif_err(priv, rx_err, priv->dev,
-			  "%s: Rx skb DMA mapping failed\n", __func__);
-		return NULL;
-	}
+	skb = build_skb(xdp->data_hard_start, PAGE_SIZE);
+	if (!skb)
+		return ERR_PTR(-ENOMEM);
 
-	/* Grab the current Rx skb from the ring and DMA-unmap it */
-	rx_skb = bcmgenet_free_rx_cb(kdev, cb);
+	skb_mark_for_recycle(skb);
 
-	/* Put the new Rx skb on the ring */
-	cb->skb = skb;
-	dma_unmap_addr_set(cb, dma_addr, mapping);
-	dma_unmap_len_set(cb, dma_len, priv->rx_buf_len);
-	dmadesc_set_addr(priv, cb->bd_addr, mapping);
+	skb_reserve(skb, xdp->data - xdp->data_hard_start);
+	skb_put(skb, xdp->data_end - xdp->data);
+	if (metasize)
+		skb_metadata_set(skb, metasize);
 
-	/* Return the current Rx skb to caller */
-	return rx_skb;
+	if (unlikely(xdp_buff_has_frags(xdp)))
+		xdp_update_skb_shared_info(skb, num_frags,
+					   sinfo->xdp_frags_size,
+					   num_frags * xdp->frame_sz,
+					   xdp_buff_is_frag_pfmemalloc(xdp));
+
+	return skb;
 }
 
 /* bcmgenet_desc_rx - descriptor based rx process.
@@ -2304,6 +2309,7 @@ static unsigned int bcmgenet_desc_rx(struct bcmgenet_rx_ring *ring,
 	struct net_device *dev = priv->dev;
 	struct enet_rx_cb *cb;
 	struct sk_buff *skb;
+	struct xdp_buff xdp_buf;
 	u32 dma_length_status;
 	unsigned long dma_flag;
 	int len;
@@ -2311,6 +2317,8 @@ static unsigned int bcmgenet_desc_rx(struct bcmgenet_rx_ring *ring,
 	unsigned int bytes_processed = 0;
 	unsigned int p_index, mask;
 	unsigned int discards;
+
+	xdp_init_buff(&xdp_buf, PAGE_SIZE, &ring->xdp_rxq);
 
 	/* Clear status before servicing to reduce spurious interrupts */
 	mask = 1 << (UMAC_IRQ1_RX_INTR_SHIFT + ring->index);
@@ -2345,15 +2353,22 @@ static unsigned int bcmgenet_desc_rx(struct bcmgenet_rx_ring *ring,
 		__be16 rx_csum;
 
 		cb = &priv->rx_cbs[ring->read_ptr];
-		skb = bcmgenet_rx_refill(priv, cb);
 
-		if (unlikely(!skb)) {
+		if (unlikely(!bcmgenet_rx_refill(priv, cb, GFP_ATOMIC))) {
 			BCMGENET_STATS64_INC(stats, dropped);
 			goto next;
 		}
 
-		status = (struct status_64 *)skb->data;
+		/* SELFNOTE do this before XDP OR move status to priv */
+		status = (struct status_64 *)page_address(cb->page);
 		dma_length_status = status->length_status;
+		len = dma_length_status >> DMA_BUFLENGTH_SHIFT;
+
+		xdp_prepare_buff(&xdp_buf, page_address(cb->page),
+			 XDP_PACKET_HEADROOM, len, true);
+
+		skb = genet_desc_rx_build_skb(ring->page_pool, &xdp_buf);
+
 		if (dev->features & NETIF_F_RXCSUM) {
 			rx_csum = (__force __be16)(status->rx_csum & 0xffff);
 			if (rx_csum) {
@@ -2366,7 +2381,6 @@ static unsigned int bcmgenet_desc_rx(struct bcmgenet_rx_ring *ring,
 		 * we got the Receive Status Vector (64B RSB or register)
 		 */
 		dma_flag = dma_length_status & 0xffff;
-		len = dma_length_status >> DMA_BUFLENGTH_SHIFT;
 
 		netif_dbg(priv, rx_status, dev,
 			  "%s:p_ind=%d c_ind=%d read_ptr=%d len_stat=0x%08x\n",
@@ -2498,42 +2512,20 @@ static void bcmgenet_dim_work(struct work_struct *work)
 	dim->state = DIM_START_MEASURE;
 }
 
-/* Assign skb to RX DMA descriptor. */
-static int bcmgenet_alloc_rx_buffers(struct bcmgenet_priv *priv,
-				     struct bcmgenet_rx_ring *ring)
-{
-	struct enet_rx_cb *cb;
-	struct sk_buff *skb;
-	int i;
-
-	netif_dbg(priv, hw, priv->dev, "%s\n", __func__);
-
-	/* loop here for each buffer needing assign */
-	for (i = 0; i < ring->size; i++) {
-		cb = ring->cbs + i;
-		skb = bcmgenet_rx_refill(priv, cb);
-		if (skb)
-			dev_consume_skb_any(skb);
-		if (!cb->skb)
-			return -ENOMEM;
-	}
-
-	return 0;
-}
-
 static void bcmgenet_free_rx_buffers(struct bcmgenet_priv *priv)
 {
-	struct sk_buff *skb;
 	struct enet_rx_cb *cb;
 	int i;
 
 	for (i = 0; i < priv->num_rx_bds; i++) {
 		cb = &priv->rx_cbs[i];
 
-		skb = bcmgenet_free_rx_cb(&priv->pdev->dev, cb);
-		if (skb)
-			dev_consume_skb_any(skb);
-	}
+		if (cb->page) {
+			/* Return page to pool */
+			page_pool_put_full_page(priv->page_pool, cb->page, false);
+			cb->page = NULL;
+		}
+    }
 }
 
 static void umac_enable_set(struct bcmgenet_priv *priv, u32 mask, bool enable)
@@ -2758,10 +2750,10 @@ static int bcmgenet_create_page_pool(struct bcmgenet_priv *priv,
 		.order = 0,
 		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
 		.pool_size = size,
-		.nid = NUMA_NO_NODE,
+		.nid = dev_to_node(priv->dev),
 		.dev = priv->dev,
 		.dma_dir = xdp_prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE,
-		.max_len = MVNETA_MAX_RX_BUF_SIZE,
+		.max_len = GENET_MAX_RX_BUF_SIZE,
 	};
 	int err;
 
@@ -2809,10 +2801,6 @@ static int bcmgenet_init_rx_ring(struct bcmgenet_priv *priv,
 	ring->read_ptr = start_ptr;
 	ring->cb_ptr = start_ptr;
 	ring->end_ptr = end_ptr - 1;
-
-	ret = bcmgenet_alloc_rx_buffers(priv, ring);
-	if (ret)
-		return ret;
 
 	bcmgenet_init_dim(ring, bcmgenet_dim_work);
 	bcmgenet_init_rx_coalesce(ring);
