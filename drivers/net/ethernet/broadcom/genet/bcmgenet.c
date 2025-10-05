@@ -24,6 +24,8 @@
 #include <linux/pm.h>
 #include <linux/clk.h>
 #include <net/arp.h>
+#include <net/xdp.h>
+#include <net/page_pool/helpers.h>
 
 #include <linux/mii.h>
 #include <linux/ethtool.h>
@@ -56,7 +58,7 @@
 #define GENET_SKB_HEADROOM  ALIGN(max(NET_SKB_PAD, XDP_PACKET_HEADROOM), SKB_ALIGNMENT)
 #define GENET_SKB_PAD (SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) + \
                           GENET_SKB_HEADROOM)
-#define GENET_MAX_RX_BUF_SIZE (GENET_RX_BUF_LEN - GENET_SKB_PAD)
+#define GENET_MAX_RX_BUF_SIZE (RX_BUF_LENGTH - GENET_SKB_PAD)
 
 /* Tx/Rx DMA register offset, skip 256 descriptors */
 #define WORDS_PER_BD(p)		(p->hw_params->words_per_bd)
@@ -2239,14 +2241,15 @@ out_unmap_frags:
 }
 
 static int bcmgenet_rx_refill(struct bcmgenet_priv *priv,
-                              struct enet_cb *cb,
+                              struct bcmgenet_rx_ring *ring,
+                              struct enet_rx_cb *cb,
                               gfp_t gfp_mask)
 {
     struct page *page;
     dma_addr_t dma;
 
     /* Allocate a page from the pool */
-    page = page_pool_alloc_pages(priv->rx_pp, gfp_mask | __GFP_NOWARN);
+    page = page_pool_alloc_pages(ring->page_pool, gfp_mask | __GFP_NOWARN);
     if (!page) {
         priv->mib.alloc_rx_buff_failed++;
         return -ENOMEM;
@@ -2354,7 +2357,7 @@ static unsigned int bcmgenet_desc_rx(struct bcmgenet_rx_ring *ring,
 
 		cb = &priv->rx_cbs[ring->read_ptr];
 
-		if (unlikely(!bcmgenet_rx_refill(priv, cb, GFP_ATOMIC))) {
+		if (unlikely(!bcmgenet_rx_refill(priv, ring, cb, GFP_ATOMIC))) {
 			BCMGENET_STATS64_INC(stats, dropped);
 			goto next;
 		}
@@ -2515,16 +2518,19 @@ static void bcmgenet_dim_work(struct work_struct *work)
 static void bcmgenet_free_rx_buffers(struct bcmgenet_priv *priv)
 {
 	struct enet_rx_cb *cb;
-	int i;
+	struct bcmgenet_rx_ring *ring;
+	int i, r;
 
-	for (i = 0; i < priv->num_rx_bds; i++) {
-		cb = &priv->rx_cbs[i];
+    for (i = 0; i <= priv->hw_params->rx_queues; ++i) {
+		ring = &priv->rx_rings[i];
 
-		if (cb->page) {
-			/* Return page to pool */
-			page_pool_put_full_page(priv->page_pool, cb->page, false);
-			cb->page = NULL;
-		}
+        for (r = 0; r < ring->size; r++) {
+            cb = &ring->cbs[r];
+            if (cb->page) {
+                page_pool_put_full_page(ring->page_pool, cb->page, false);
+                cb->page = NULL;    
+            }
+        }
     }
 }
 
@@ -2743,15 +2749,15 @@ static void bcmgenet_init_tx_ring(struct bcmgenet_priv *priv,
 }
 
 static int bcmgenet_create_page_pool(struct bcmgenet_priv *priv,
-				      struct bcmgenet_rx_ring *ring)
+				      struct bcmgenet_rx_ring *ring, int size)
 {
 	struct bpf_prog *xdp_prog = READ_ONCE(priv->xdp_prog);
 	struct page_pool_params pp_params = {
 		.order = 0,
 		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
 		.pool_size = size,
-		.nid = dev_to_node(priv->dev),
-		.dev = priv->dev,
+		.nid = dev_to_node(&priv->dev->dev),
+		.dev = &priv->dev->dev,
 		.dma_dir = xdp_prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE,
 		.max_len = GENET_MAX_RX_BUF_SIZE,
 	};
@@ -2780,7 +2786,7 @@ err_unregister_rxq:
 	xdp_rxq_info_unreg(&ring->xdp_rxq);
 err_free_pp:
 	page_pool_destroy(ring->page_pool);
-	rxq->page_pool = NULL;
+	ring->page_pool = NULL;
 	return err;
 }
 
@@ -2806,7 +2812,7 @@ static int bcmgenet_init_rx_ring(struct bcmgenet_priv *priv,
 	bcmgenet_init_rx_coalesce(ring);
 
 	/* Initialize Page Pool for RX */
-	ret = bcmgenet_create_page_pool(priv, ring);
+	ret = bcmgenet_create_page_pool(priv, ring, size);
 	if (ret) {
 		netdev_err(priv->dev, "failed to initialize RX page pool\n");
 		return ret;

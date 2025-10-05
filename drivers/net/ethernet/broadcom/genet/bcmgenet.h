@@ -16,6 +16,9 @@
 #include <linux/dim.h>
 #include <linux/ethtool.h>
 
+#include <net/xdp.h>
+
+
 #include "../unimac.h"
 
 /* Maximum number of hardware queues, downsized if needed */
