@@ -2357,7 +2357,7 @@ static unsigned int bcmgenet_desc_rx(struct bcmgenet_rx_ring *ring,
 
 		cb = &priv->rx_cbs[ring->read_ptr];
 
-		if (unlikely(!bcmgenet_rx_refill(priv, ring, cb, GFP_ATOMIC))) {
+		if (unlikely(bcmgenet_rx_refill(priv, ring, cb, GFP_ATOMIC))) {
 			BCMGENET_STATS64_INC(stats, dropped);
 			goto next;
 		}
@@ -2756,8 +2756,8 @@ static int bcmgenet_create_page_pool(struct bcmgenet_priv *priv,
 		.order = 0,
 		.flags = PP_FLAG_DMA_MAP | PP_FLAG_DMA_SYNC_DEV,
 		.pool_size = size,
-		.nid = dev_to_node(&priv->dev->dev),
-		.dev = &priv->dev->dev,
+		.nid = dev_to_node(&priv->pdev->dev),
+		.dev = &priv->pdev->dev,
 		.dma_dir = xdp_prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE,
 		.max_len = GENET_MAX_RX_BUF_SIZE,
 	};
