@@ -58,7 +58,7 @@
 #define GENET_SKB_HEADROOM  ALIGN(max(NET_SKB_PAD, XDP_PACKET_HEADROOM), SKB_ALIGNMENT)
 #define GENET_SKB_PAD (SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) + \
                           GENET_SKB_HEADROOM)
-#define GENET_MAX_RX_BUF_SIZE (RX_BUF_LENGTH - GENET_SKB_PAD)
+#define GENET_MAX_RX_BUF_SIZE (RX_BUF_LENGTH + GENET_SKB_PAD)
 
 /* Tx/Rx DMA register offset, skip 256 descriptors */
 #define WORDS_PER_BD(p)		(p->hw_params->words_per_bd)
@@ -2256,7 +2256,7 @@ static int bcmgenet_rx_refill(struct bcmgenet_priv *priv,
     }
 
     /* Get DMA address for NIC */
-    dma = page_pool_get_dma_addr(page);
+    dma = page_pool_get_dma_addr(page) + GENET_SKB_HEADROOM;
 
     /* Program descriptor with this DMA address */
     dmadesc_set_addr(priv, cb->bd_addr, dma);
@@ -2531,6 +2531,9 @@ static void bcmgenet_free_rx_buffers(struct bcmgenet_priv *priv)
                 cb->page = NULL;    
             }
         }
+
+		page_pool_destroy(ring->page_pool);
+		ring->page_pool = NULL;
     }
 }
 
