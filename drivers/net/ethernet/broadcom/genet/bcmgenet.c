@@ -2256,7 +2256,7 @@ static int bcmgenet_rx_refill(struct bcmgenet_priv *priv,
     }
 
     /* Get DMA address for NIC */
-    dma = page_pool_get_dma_addr(page) + GENET_SKB_HEADROOM;
+    dma = page_pool_get_dma_addr(page) + GENET_SKB_PAD;
 
     /* Program descriptor with this DMA address */
     dmadesc_set_addr(priv, cb->bd_addr, dma);
@@ -2282,6 +2282,13 @@ genet_desc_rx_build_skb(struct page_pool *pool,
 		num_frags = sinfo->nr_frags;
 
 	skb = build_skb(xdp->data_hard_start, PAGE_SIZE);
+
+	if (dma_unmap_addr(cb, dma_addr)) {
+		dma_unmap_single(dev, dma_unmap_addr(cb, dma_addr),
+				 dma_unmap_len(cb, dma_len), DMA_FROM_DEVICE);
+		dma_unmap_addr_set(cb, dma_addr, 0);
+	}
+
 	if (!skb)
 		return ERR_PTR(-ENOMEM);
 
@@ -2761,6 +2768,7 @@ static int bcmgenet_create_page_pool(struct bcmgenet_priv *priv,
 		.pool_size = size,
 		.nid = dev_to_node(&priv->pdev->dev),
 		.dev = &priv->pdev->dev,
+		.offset = GENET_SKB_PAD,
 		.dma_dir = xdp_prog ? DMA_BIDIRECTIONAL : DMA_FROM_DEVICE,
 		.max_len = GENET_MAX_RX_BUF_SIZE,
 	};
